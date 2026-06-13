@@ -1,0 +1,9 @@
+{
+  "version": "1.0.12",
+  "label": "Gopher Geyser Remote Control Firmware v1.0.12",
+  "url": "https://github.com/gopher-geyser/firmware-releases/releases/download/v1.0.12/firmware.bin",
+  "size": 1810672,
+  "sha256": "",
+  "min_app_version": "1.0.2389",
+  "requires_ota_partition": true
+}
