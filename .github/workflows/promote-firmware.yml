@@ -1,0 +1,245 @@
+name: Promote firmware to customers
+
+# Copies a tested build from the private dev channel to the public channel that
+# every customer controller reads.
+#
+# This workflow lives in the PUBLIC gopher-geyser/firmware-releases repo on
+# purpose. GitHub Free does not allow environment protection rules on private
+# repos — verified, `branches/master/protection` on the private firmware repo
+# returns 403 "Upgrade to GitHub Pro or make this repository public". Public
+# repos get required reviewers for free, so the gate can only be enforced here.
+#
+# Setup this depends on (see the runbook):
+#   * an environment named `production` with the second developer as a
+#     required reviewer, and "prevent self-review" enabled — without that, the
+#     person who dispatches a run can approve their own and the gate is
+#     decorative;
+#   * GH_FIRMWARE_RELEASES_WRITE and DEV_RELEASES_READ as *environment*
+#     secrets on `production`, not repository secrets, so an unapproved job
+#     cannot read them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to promote, e.g. 1.0.14 (must already exist in the dev channel)
+        required: true
+      release_notes:
+        description: Release notes for customers
+        required: false
+        default: ""
+
+concurrency:
+  group: promote-firmware
+  cancel-in-progress: false
+
+env:
+  DEV_REPO: gopher-geyser/dev-releases
+  PUBLIC_REPO: gopher-geyser/firmware-releases
+  RELEASE_VERSION: ${{ inputs.version }}
+  RELEASE_NOTES: ${{ inputs.release_notes }}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  promote:
+    if: github.ref == 'refs/heads/main' && github.repository == 'gopher-geyser/firmware-releases'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Pauses here until a required reviewer approves.
+    environment: production
+
+    steps:
+      - name: Check out the public releases repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Require the production review gate and pinned verification key
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -f keys/ota-signing-public.pem
+          gh api "repos/$PUBLIC_REPO/environments/production" > "$RUNNER_TEMP/environment.json"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          environment = json.loads((Path(os.environ['RUNNER_TEMP']) / 'environment.json').read_text())
+          rules = [r for r in environment.get('protection_rules', []) if r['type'] == 'required_reviewers']
+          if not rules or not rules[0].get('prevent_self_review') or not rules[0].get('reviewers'):
+              raise SystemExit('Production requires a reviewer and prevention of self-review before signing.')
+          PY
+
+      - name: Fetch the tested build from the dev channel
+        env:
+          GH_TOKEN: ${{ secrets.DEV_RELEASES_READ }}
+        run: |
+          set -euo pipefail
+          VERSION="$RELEASE_VERSION"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version must look like 1.0.14, got '$VERSION'"
+            exit 1
+          fi
+
+          gh release download "fw-v$VERSION" \
+            --repo "$DEV_REPO" \
+            --pattern firmware.bin \
+            --dir .
+
+          gh api "repos/$DEV_REPO/contents/firmware-manifest.json?ref=main" \
+            --jq '.content' | base64 -d > dev-manifest.json
+
+      # The binary that ships must be the binary that was tested. Rebuilding
+      # from source here would quietly reintroduce "what shipped is not what we
+      # tried", which is the whole thing this gate exists to prevent.
+      - name: Verify the artifact matches what the dev channel recorded
+        run: |
+          set -euo pipefail
+          VERSION="$RELEASE_VERSION"
+          EXPECTED_VERSION=$(jq -r .version dev-manifest.json)
+          EXPECTED_SHA=$(jq -r .sha256 dev-manifest.json)
+          EXPECTED_SIZE=$(jq -r .size dev-manifest.json)
+
+          if [ "$EXPECTED_VERSION" != "$VERSION" ]; then
+            echo "::error::The dev channel currently holds v$EXPECTED_VERSION, not v$VERSION. Only the current dev build can be promoted."
+            exit 1
+          fi
+
+          ACTUAL_SHA=$(sha256sum firmware.bin | cut -d' ' -f1)
+          ACTUAL_SIZE=$(stat -c%s firmware.bin)
+
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::SHA-256 mismatch. Expected $EXPECTED_SHA, got $ACTUAL_SHA."
+            exit 1
+          fi
+          if [ "$ACTUAL_SIZE" != "$EXPECTED_SIZE" ]; then
+            echo "::error::Size mismatch. Expected $EXPECTED_SIZE, got $ACTUAL_SIZE."
+            exit 1
+          fi
+
+          {
+            echo "size=$ACTUAL_SIZE"
+            echo "sha256=$ACTUAL_SHA"
+          } >> "$GITHUB_ENV"
+
+      - name: Authorize these exact tested bytes for protected customer boards
+        env:
+          FW_PRODUCTION_SIGNING_PRIVATE_KEY: ${{ secrets.FW_PRODUCTION_SIGNING_PRIVATE_KEY }}
+          FW_PRODUCTION_SIGNING_KEY_PASSWORD: ${{ secrets.FW_PRODUCTION_SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$FW_PRODUCTION_SIGNING_PRIVATE_KEY"
+          SECURITY_VERSION=$(jq -er '.security_version | select(type == "number" and . >= 1 and . == floor)' dev-manifest.json)
+          KEY_FILE="$RUNNER_TEMP/gopher-production-signing.pem"
+          export KEY_FILE
+          trap 'rm -f "$KEY_FILE"' EXIT
+          python - <<'PY'
+          import os
+          with open(os.environ['KEY_FILE'], 'x', opener=lambda p, f: os.open(p, f, 0o600)) as out:
+              out.write(os.environ['FW_PRODUCTION_SIGNING_PRIVATE_KEY'])
+          PY
+          printf '%s\n' "$FW_PRODUCTION_SIGNING_KEY_PASSWORD" | python .github/scripts/sign_ota_metadata.py \
+            --binary firmware.bin --version "$RELEASE_VERSION" --security-version "$SECURITY_VERSION" \
+            --private-key "$KEY_FILE" --public-key keys/ota-signing-public.pem \
+            --password-stdin --output signed-metadata.json
+
+      - name: Publish the public release
+        env:
+          GH_TOKEN: ${{ secrets.GH_FIRMWARE_RELEASES_WRITE }}
+        run: |
+          set -euo pipefail
+          VERSION="$RELEASE_VERSION"
+          NOTES="$RELEASE_NOTES"
+          if [ -z "$NOTES" ]; then
+            NOTES="Gopher Geyser Remote Control Firmware v$VERSION"
+          fi
+
+          if gh release view "v$VERSION" --repo "$PUBLIC_REPO" >/dev/null 2>&1; then
+            echo "::error::v$VERSION is already published to customers."
+            exit 1
+          fi
+
+          gh release create "v$VERSION" \
+            --repo "$PUBLIC_REPO" \
+            --title "Firmware v$VERSION" \
+            --notes "$NOTES" \
+            firmware.bin signed-metadata.json keys/ota-signing-public.pem
+
+      - name: Update the public manifest
+        env:
+          GH_TOKEN: ${{ secrets.GH_FIRMWARE_RELEASES_WRITE }}
+        run: |
+          set -euo pipefail
+          VERSION="$RELEASE_VERSION"
+
+          # Fields the app parses are version/label/url/size/sha256. The other
+          # two are carried forward from the existing manifest so the shape
+          # does not change under anything reading it.
+          jq -n \
+            --slurpfile signed signed-metadata.json \
+            --arg version "$VERSION" \
+            --arg sha256 "$sha256" \
+            --argjson size "$size" \
+            --arg url "https://github.com/gopher-geyser/firmware-releases/releases/download/v$VERSION/firmware.bin" \
+            --arg minApp "$(jq -r '.min_app_version // "1.0.2389"' firmware-manifest.json)" \
+            --argjson otaPartition "$(jq -r '.requires_ota_partition // true' firmware-manifest.json)" \
+            '{
+              version: $version,
+              label: ("Gopher Geyser Remote Control Firmware v" + $version),
+              url: $url,
+              size: $size,
+              sha256: $sha256,
+              security_version: $signed[0].security_version,
+              signature: $signed[0].signature,
+              min_app_version: $minApp,
+              requires_ota_partition: $otaPartition
+            }' > firmware-manifest.json.new
+          mv firmware-manifest.json.new firmware-manifest.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add firmware-manifest.json
+          git commit -m "Firmware v$VERSION"
+          gh auth setup-git
+          git push
+
+      # Controllers fetch this with no credentials at all. If either URL needs
+      # auth, every controller in the field silently fails to update.
+      - name: Verify both URLs are reachable unauthenticated
+        run: |
+          set -euo pipefail
+          VERSION="$RELEASE_VERSION"
+          MANIFEST_URL="https://raw.githubusercontent.com/$PUBLIC_REPO/main/firmware-manifest.json"
+          BIN_URL="https://github.com/$PUBLIC_REPO/releases/download/v$VERSION/firmware.bin"
+
+          # raw.githubusercontent caches briefly after a push.
+          for attempt in 1 2 3 4 5; do
+            PUBLISHED=$(curl -fsSL "$MANIFEST_URL" | jq -r .version || echo "")
+            [ "$PUBLISHED" = "$VERSION" ] && break
+            echo "Manifest still shows '$PUBLISHED', waiting…"
+            sleep 15
+          done
+          if [ "$PUBLISHED" != "$VERSION" ]; then
+            echo "::error::Public manifest still does not report v$VERSION."
+            exit 1
+          fi
+
+          CODE=$(curl -o /dev/null -sIL -w '%{http_code}' "$BIN_URL")
+          if [ "$CODE" != "200" ]; then
+            echo "::error::Firmware binary is not publicly reachable (HTTP $CODE)."
+            exit 1
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "### Promoted firmware v$RELEASE_VERSION to customers"
+            echo ""
+            echo "Approved by @${{ github.actor }}'s reviewer."
+            echo ""
+            echo "Open a PR in gopher-geyser/firmware syncing"
+            echo "\`releases/firmware-manifest.json\` to match."
+          } >> "$GITHUB_STEP_SUMMARY"

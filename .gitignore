@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.key
+*.p12
+*.pfx
+*.pem
+!keys/ota-signing-public.pem
